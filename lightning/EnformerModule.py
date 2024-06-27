@@ -32,15 +32,15 @@ class EnformerModule(pl.LightningModule):
         pred_human = self.model(batch["human"]["sequence"])
         loss_human = self.criterion(pred_human, batch["human"]["target"])
 
-        pred_mouse = self.model(batch["mouse"]["sequence"])
-        loss_mouse = self.criterion(pred_mouse, batch["mouse"]["target"])
+        # pred_mouse = self.model(batch["mouse"]["sequence"])
+        # loss_mouse = self.criterion(pred_mouse, batch["mouse"]["target"])
 
-        loss = loss_human + loss_mouse
+        loss = loss_human # + loss_mouse
  
         loss_dict = { 
             "loss": loss,
-            "loss_human": loss_human,
-            "loss_mouse": loss_mouse,
+            "loss_human": loss_human
+            # "loss_mouse": loss_mouse,
         }  
         
         return loss_dict
