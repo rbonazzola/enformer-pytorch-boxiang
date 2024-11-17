@@ -1,6 +1,7 @@
-Pytorch implementation of DeepMind's enformer.
+PyTorch implementation of DeepMind's Enformer model.
 
-This implementation is inspired by a previous pytorch [implementation](https://github.com/lucidrains/enformer-pytorch) of enformer. This implementation has more careful weight initialization, and comes with a dataloader and training scripts.
+The model implementation is by [Phil Wang](https://github.com/lucidrains) and [Boxiang Liu](https://github.com/boxiangliu/). I added the data pre-processing and training scripts
+
 
 
 # Setup
@@ -8,28 +9,41 @@ This implementation is inspired by a previous pytorch [implementation](https://g
 This package has the following dependencies:
 
 ```
-python==3.8.6
+python==3.11.8
 einops
-torch==1.10
+torch==2.3.0
 numpy
-tensorflow==2.4.1
 tqdm
 pandas
+mlflow
 ```
 
-see `requirements.txt`
+Also, install the [EZPZ library](https://github.com/saforem2/ezpz).
 
-# Download toy data
+### Prepare dataset
+Folder `data/` contains code to prepare the dataset according to the following steps:
+- Download reference genome for humans and for mice,
+- split into regions, one-hot encode,
+- save into HDF5 format.
+
+For personalized genomes, VCF files must be available.
+
+### Train model with toy data
+The training script `main_ezpz_mlflow.py` uses the EZPZ library to handle the distributed setting and MLflow to perform experiment tracking.
+
+These trainings were performed on ALCF's Polaris HPC.
 
 ```
-python data/download.py
+EZPZ="/path/to/ezpz/"
+
+source $EZPZ/src/ezpz/bin/savejobenv
+CKPT_DIR=/path/to/ckpt/dir
+unset NCCL_COLLNET_ENABLE NCCL_CROSS_NIC NCCL_NET NCCL_NET_GDR_LEVEL
+launch python3 main_ezpz_mlflow.py --num_warmup_steps 5000 --ckpt-dir $CKPT_DIR --compile-model
 ```
 
-# Train model with toy data
+`launch` is defined in the `savejobenv` script.
 
-```
-python bin/train.py
-```
 
 # Citation
 
