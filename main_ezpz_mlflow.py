@@ -1,5 +1,7 @@
 from mpi4py import MPI
 
+import torch.distributed as dist
+
 import torch
 from torch import nn, optim
 # from torch.utils.data import random_split, Dataset, DataLoader
@@ -16,7 +18,7 @@ try:
     import mlflow
 except:    
     mlflow = None
-    logging.warning("mlflow is not available")
+    logging.warning("MLflow is not available")
 
 import ezpz as ez
 
@@ -24,6 +26,9 @@ from model import enformer
 from dataset import HDF5Dataset, get_dataloaders
 
 from IPython import embed
+
+SEQUENCE_LENGTH = 196_608
+TARGET_LENGTH = 896
 
 ####################################################################################################
 
@@ -63,6 +68,35 @@ if (dtype := os.environ.get("DTYPE", None)) is not None:
 
 os.environ["TMPDIR"] = "/grand/TFXcan/imlab/data/enformer_pytorch_training/tmp"
 
+def init_distributed():
+    dist.init_process_group(backend='nccl', init_method='env://')
+
+def is_distributed():
+    return dist.is_available() and dist.is_initialized()
+
+def average_loss_across_gpus(loss, world_size):
+
+    if is_distributed():
+        # Convert loss to tensor and move it to the correct device
+        loss_tensor = torch.tensor(loss).cuda()
+        logger.info("Starting all_reduce operation...")
+        
+        #torch.cuda.synchronize()  # Synchronize before the all_reduce
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        logger.info(f"The all_reduce finished")
+
+        # Synchronize to ensure the operation finishes
+        # torch.cuda.synchronize()
+        logger.info(f"The cuda synchronize finished")
+        
+        avg_loss = loss_tensor.cpu().item() / world_size
+        logger.info(f"Finished all_reduce, average loss: {avg_loss:.4f}")
+    else:
+        avg_loss = loss
+    return avg_loss
+
+
+
 def save_checkpoint(model, optimizer, scaler, epoch, checkpoint_dir):
 
     """Saves model, optimizer, and scaler states."""
@@ -81,11 +115,40 @@ def save_checkpoint(model, optimizer, scaler, epoch, checkpoint_dir):
     torch.save(checkpoint, checkpoint_path)
     logger.info(f"Checkpoint saved at {checkpoint_path}")
 
+
+def validate(model, dataloader, criterion, world_size):
+    
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for inputs, targets in dataloader:
+            inputs = inputs.cuda(non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
+
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            
+            # Accumulate loss
+            total_loss += loss.item()
+            num_batches += 1
+
+    # Average the loss across all batches on each GPU
+    avg_loss = total_loss / num_batches
+
+    # Average the loss across all GPUs
+    avg_loss = average_loss_across_gpus(avg_loss, world_size)
+
+    return avg_loss
+
+
 ####################################################################################################
 
 class Trainer():
 
-    def __init__(self, model, dataloaders, optimizer, device, checkpoint_dir, log_freq=10, checkpoint_freq=1, precision: str = "single", max_epochs=10):
+    def __init__(self, model, dataloaders, optimizer, device, checkpoint_dir, log_freq=10, checkpoint_freq=1, precision: str = "single", gradient_clip=0.2, max_epochs=10):
 
         self.model = model
         self.train_dataloader, self.val_dataloader, self.test_dataloader = dataloaders
@@ -103,7 +166,9 @@ class Trainer():
 
         self.precision = precision
 
-        self.checkpoint_dir = checkpoint_dir # 
+        self.checkpoint_dir = checkpoint_dir 
+
+        self.gradient_clip = gradient_clip
         self.initialize()
 
 
@@ -113,6 +178,8 @@ class Trainer():
         self.val_iter = iter(self.val_dataloader)
         self.criterion = nn.PoissonNLLLoss(log_input=False, reduction="none")
         self.scaler = GradScaler()
+        self._train_outputs = []
+        self._val_outputs = []
 
     
     def train_step(self):
@@ -159,7 +226,9 @@ class Trainer():
         self.n_step += 1
 
         try:
+            # if RANK == 0: self.n_step += 1
             batch     = next(self.iter)
+            
         except StopIteration:            
             self.train_epoch_end()
             self.iter = iter(self.train_dataloader)            
@@ -177,8 +246,14 @@ class Trainer():
             loss_mn = loss.mean()
             loss_mn.backward()
             
-            # if RANK == 0:
-            if (RANK == 0) and (self.n_step % self._log_freq) == 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+
+            self._train_outputs.append(loss_mn)
+            
+            # if (RANK == 0) and (self.n_step % self._log_freq) == 0:
+            if (self.n_step % self._log_freq) == 0:
+                # loss_value = average_loss_across_gpus(loss_mn.item(), world_size=dist.get_world_size())
+                # logger.info(f"step: {self.n_step}, head: {head}; loss: {loss_value:03f}")
                 logger.info(f"step: {self.n_step}, head: {head}; loss: {loss_mn.item():03f}")
             
             self.optimizer.step()
@@ -191,9 +266,17 @@ class Trainer():
         if RANK == 0 and (self.current_epoch % self._checkpoint_freq) == 0:
             save_checkpoint(self.model, self.optimizer, self.scaler, self.current_epoch, self.checkpoint_dir)
 
+        # sum(self._train_outputs.append(loss_mn)) / dist.get_world_size()
+
         self.n_step = 0
         self.current_epoch += 1
         
+
+    def validate(self):
+        world_size = dist.get_world_size()
+        val_loss = validate(self.model, self.val_dataloader, self.criterion, world_size)
+        return val_loss
+
 
     def validation_step(self):
         
@@ -345,12 +428,15 @@ def main(args):
         mlflow.log_param("n_gpus", WORLD_SIZE)
         mlflow.log_param("parallelization_backend", backend)
 
+    # 3*2**9 == 1536
     enformer_params = dict(channels=3*2**9, num_heads=8, num_transformer_layers=11)
     
     args.from_checkpoint = args.from_checkpoint if args.from_checkpoint is not None else False
 
     model, optimizer, epoch = build_model_and_optimizer(enformer_params, from_checkpoint=args.from_checkpoint)        
-    # model = torch.compile(model)
+
+    if args.compile_model:
+        model = torch.compile(model)
 
     sampler_cfg = {
         "num_replicas": WORLD_SIZE,
@@ -379,32 +465,45 @@ def main(args):
 
     for n_epoch in range(10):
         
-        logger.info(f"Epoch: {n_epoch}")
+        if RANK == 0:
+            logger.info(f"Epoch: {n_epoch}")
         
         model.train()
         start_time = time.time()  # start time
-        
+        previous_epoch = 0
+
         # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:
         #    with record_function("model_inference"):
         #        loss_trn = trainer.train_step()
 
         # logger.info(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=10))
 
-        previous_epoch = 0
+        def set_lr_on_ramp(optimizer, trainer, num_warmup_steps):
+            
+            if trainer.n_step <= args.num_warmup_steps:
+                learning_rate_frac = min(1.0, trainer.n_step / max(1.0, args.num_warmup_steps))                
+                current_lr = target_learning_rate * learning_rate_frac
+                
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
+            
+            return current_lr
+
 
         while True:
 
             # LR warmup
             if trainer.n_step <= args.num_warmup_steps:
-                learning_rate_frac = min(1.0, trainer.n_step / max(1.0, args.num_warmup_steps))
+                learning_rate_frac = min(1.0, trainer.n_step / max(1.0, args.num_warmup_steps))                
                 current_lr = target_learning_rate * learning_rate_frac
+                
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = current_lr
 
             loss_trn = trainer.train_step()            
             
-            end_time = time.time()  # Tiempo de finalización
-            step_time = end_time - start_time  # Tiempo por paso
+            end_time = time.time()
+            step_time = end_time - start_time
 
             if RANK == 0:
                 mlflow.log_metric("training_step_time", step_time)            
@@ -418,14 +517,14 @@ def main(args):
                     start_time = time.time()  # Tiempo de inicio        
 
                 # model.eval()        
-                #  for _ in range(1000):
+                
                 # loss_val = trainer.validation_step()
                 # end_time = time.time()  # end time
                 # step_time = end_time - start_time  # time per step
 
-                if RANK == 0:
-                    mlflow.log_metric("val_step_time", step_time)
-                    mlflow.log_metric("val_loss", loss_val)                        
+                # if RANK == 0:
+                    # mlflow.log_metric("val_step_time", step_time)
+                    # mlflow.log_metric("val_loss", loss_val)                        
 
         trainer.val_epoch_end()
 
@@ -444,16 +543,18 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", "--n_workers", "--num-workers", "--n-workers", dest="num_workers", type=int, default=0)    
     parser.add_argument("--max_epochs", "--max-epochs", dest="max_epochs", type=int, default=1000)    
     
-    parser.add_argument("--mlflow_uri", "--mlflow-uri", type=str, default="mlruns-enformer-test-warmup")       
+    parser.add_argument("--mlflow_uri", "--mlflow-uri", type=str, default="mlruns-enformer-test-warmup-16-11-2024")       
     parser.add_argument("--mlflow_experiment", "--mlflow-experiment", "--mlflow-experiment-name", "--expname", dest="mlflow_expname", type=str, default="Enformer - test - warmup")       
     parser.add_argument("--mlflow_run_name", "--run_name", dest="mlflow_run_name", type=str)
 
     parser.add_argument("--split-lengths", "--split_lengths", dest="split_lengths", nargs='+', type=int, default=[32000, 1992])    
-    parser.add_argument("--from-checkpoint", "--from_checkpoint", dest="from_checkpoint", type=str, default=None)
+    parser.add_argument("--from-checkpoint", "--from_checkpoint", "--from-ckpt", "--from_ckpt", dest="from_checkpoint", type=str, default=None)
 
     parser.add_argument("--ckpt-dir", "--checkpoint-dir", "--ckpt_dir", "--checkpoint_dir", dest="ckpt_dir", 
                         type=str, default="/grand/TFXcan/imlab/data/enformer_training_data/larger_window/checkpoints")
         
+    parser.add_argument("--compile_model", "--compile-model", action='store_true', default=False)
+
     # parser.add_argument("--comments", type=str, help="Comments to be added to the MLflow run as a tag.")
     
     args = parser.parse_args()
